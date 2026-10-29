@@ -1,5 +1,10 @@
 <div align="center">
 
+[![CI](https://github.com/EAnge1o/argus-night/actions/workflows/ci.yml/badge.svg)](https://github.com/EAnge1o/argus-night/actions/workflows/ci.yml)
+[![Node](https://img.shields.io/badge/node-%E2%89%A518.17-brightgreen)](https://nodejs.org)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![zero dependencies](https://img.shields.io/badge/runtime%20deps-0-orange)](package.json)
+
 # 🌙 Argus — coding agent 守夜人
 
 **整晚无人值守地驱动 Claude Code / Codex 等编码 agent：
