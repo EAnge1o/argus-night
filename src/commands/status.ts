@@ -30,6 +30,17 @@ export async function cmdStatus(root: string, flags: { follow?: boolean }): Prom
       `累计: 花费 $${(t.costUsd ?? 0).toFixed(4)} · 重启 ${t.restarts ?? 0} · 看门狗 ${t.hangKills ?? 0} · 配额等待 ${fmtDur(t.quotaSleepMs ?? 0)}`,
     );
     lines.push(`更新于: ${status.updatedAt ?? "?"}`);
+    if (Array.isArray(status.workers) && status.workers.length) {
+      lines.push("");
+      lines.push("并行 worker:");
+      for (const w of status.workers) {
+        lines.push(`  w${w.id}  ${w.task ?? "（空闲）"}`);
+      }
+    }
+    if (Array.isArray(status.leftoverBranches) && status.leftoverBranches.length) {
+      lines.push("");
+      lines.push(`待人工合并分支: ${status.leftoverBranches.join(", ")}`);
+    }
     const journalPath = Journal.latestJournal(root);
     if (journalPath) {
       lines.push("");

@@ -58,7 +58,19 @@ function run(prompt) {
     process.exit(1);
   }
 
-  // Success path: a little activity, then a claude-style result line.
+  // Success path: touch real files (proves worktree isolation & merge-back),
+  // a little activity, then a claude-style result line.
+  try {
+    const outDir = path.join(process.cwd(), "fake-out");
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, `${hash}.txt`), `done: ${prompt.slice(0, 60).replace(/\n/g, " ")}\n`);
+    if (prompt.includes("[clash]")) {
+      // Two clash tasks append to the same file in different worktrees → merge conflict.
+      fs.appendFileSync(path.join(process.cwd(), "collide.txt"), `${hash} ${prompt.slice(0, 30).replace(/\n/g, " ")}\n`);
+    }
+  } catch {
+    /* read-only cwd in some setups; the fake run still succeeds */
+  }
   let ticks = 0;
   const timer = setInterval(() => {
     ticks += 1;

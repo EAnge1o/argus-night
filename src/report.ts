@@ -84,6 +84,18 @@ export function writeReport(
     }
   }
 
+  const mergeConflicts = by("merge_conflict");
+  if (mergeConflicts.length) {
+    lines.push("");
+    lines.push("## 待人工合并（并行模式冲突）");
+    lines.push("");
+    for (const e of mergeConflicts) {
+      lines.push(`- ⚠️ ${truncate(String(e.task ?? ""), 70)} — 分支 \`${e.branch ?? "?"}\`${e.path ? `（worktree: ${e.path}）` : ""}`);
+    }
+    lines.push("");
+    lines.push("> 这些任务的成果已经提交在各自分支上，只是没能自动合并。处理：`git merge <分支名>` 解冲突，或 `git worktree remove` + `git branch -D` 放弃。");
+  }
+
   if (crashes.length) {
     lines.push("");
     lines.push("## 崩溃与退避");

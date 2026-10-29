@@ -35,6 +35,9 @@ export interface RunnerDeps {
   /** Absolute stop deadline (from stop.until / maxHours); the quota nap won't cross it. */
   stopAt: Date | null;
   onInterrupted: () => boolean;
+  /** Directory the agent runs in: the main checkout, or this worker's worktree. */
+  cwd: string;
+  workerId?: number;
 }
 
 const DEFAULT_EXCLUDES = [".git", "node_modules", ".argus"];
@@ -54,6 +57,10 @@ export class AgentRunner {
   private get adapter() {
     if (!this._adapter) this._adapter = getAdapter(this.d.cfg);
     return this._adapter;
+  }
+
+  get workerId(): number | undefined {
+    return this.d.workerId;
   }
 
   /** Best-effort kill of the live agent process (Ctrl+C path). */
@@ -240,13 +247,13 @@ export class AgentRunner {
     try {
       if (plan.needsCmdWrap) {
         child = spawn("cmd.exe", ["/d", "/s", "/c", plan.file, ...plan.args], {
-          cwd: process.cwd(),
+          cwd: this.d.cwd,
           stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
         });
       } else {
         child = spawn(plan.file, plan.args, {
-          cwd: process.cwd(),
+          cwd: this.d.cwd,
           stdio: ["pipe", "pipe", "pipe"],
           detached: process.platform !== "win32",
           windowsHide: true,
@@ -289,7 +296,13 @@ export class AgentRunner {
       const capture = this.adapter.parseLine(line);
       if (capture?.sessionId) this.lastSessionId = capture.sessionId;
       if (sig.type !== "none") {
-        journal.append("output_signal", { task: taskText, source, signal: sig.type, matched: sig.matched });
+        journal.append("output_signal", {
+          task: taskText,
+          source,
+          signal: sig.type,
+          matched: sig.matched,
+          ...(this.d.workerId != null ? { worker: this.d.workerId } : {}),
+        });
       }
     };
 
@@ -346,7 +359,7 @@ export class AgentRunner {
   }
 
   private startFsHeartbeat(watchdog: HeartbeatWatchdog): () => void {
-    const root = process.cwd();
+    const root = this.d.cwd;
     const excludes = [...DEFAULT_EXCLUDES, ...this.d.cfg.fsHeartbeatExclude];
     let lastPoke = 0;
     try {

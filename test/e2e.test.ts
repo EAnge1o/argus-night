@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -156,6 +156,87 @@ test("e2e: dry-run 只打印计划不启动 agent", async () => {
   assert.doesNotMatch(fs.readFileSync(p.todoPath, "utf8"), /\[x\]/);
   const j = journalText(p.root);
   assert.doesNotMatch(j, /"type":"spawn"/);
+});
+
+function git(root: string, args: string[]): string {
+  return execFileSync("git", args, { cwd: root, encoding: "utf8" });
+}
+
+/** 把临时项目变成带一次提交的干净 git 仓库（并行模式的前提）。 */
+function gitInitProject(p: Project): void {
+  fs.writeFileSync(path.join(p.root, ".gitignore"), ".argus/\nnode_modules/\n");
+  git(p.root, ["init", "-b", "main"]);
+  git(p.root, ["add", "-A"]);
+  git(p.root, ["-c", "user.name=t", "-c", "user.email=t@t.local", "commit", "-m", "init"]);
+}
+
+test("e2e 并行: 2 worker × 4 任务，worktree 隔离、自动合并、配额不阻塞其他 worker", { timeout: 240_000 }, async () => {
+  cleanFakeState();
+  const p = makeProject(
+    ["[p] task one", "[p] task two", "[quota] p task three", "[p] task four"],
+    { parallel: { workers: 2, merge: "auto" } },
+  );
+  gitInitProject(p);
+  const { code, out } = await runCli(p.root, ["--verbose"]);
+  assert.equal(code, 0, `退出码非 0\n${out}`);
+  assert.match(out, /并行模式/);
+
+  // 4 个任务全部完成并勾选
+  const md = fs.readFileSync(p.todoPath, "utf8");
+  for (const t of ["task one", "task two", "p task three", "task four"]) {
+    assert.match(md, new RegExp(`\\[x\\] .*${t.replace(/[[\]]/g, "\\$&")}`));
+  }
+  // 每个 worker 的成果文件都通过 merge 回到了主工作区
+  const fakeOut = path.join(p.root, "fake-out");
+  assert.ok(fs.existsSync(fakeOut), "fake-out 目录应已合并回主仓库");
+  assert.equal(fs.readdirSync(fakeOut).length, 4, "4 个任务的产出都应在主仓库");
+
+  // 配额等待只挡住自己的 worker，其他 worker 继续干活
+  assert.match(journalText(p.root), /"type":"quota_wait"/);
+  assert.match(journalText(p.root), /"type":"merge_ok"/);
+  // worktree 已清理，分支已删除
+  const wtList = git(p.root, ["worktree", "list"]).trim();
+  assert.equal(wtList.split("\n").length, 1, `应只剩主工作区:\n${wtList}`);
+  const branches = git(p.root, ["branch", "--list", "argus/*"]).trim();
+  assert.equal(branches, "", `worker 分支应已删除: ${branches}`);
+});
+
+test("e2e 并行: 同文件冲突 → 任务算成功、分支保留待人工、运行不中断", { timeout: 240_000 }, async () => {
+  cleanFakeState();
+  const p = makeProject(["[clash] A edits collide", "[clash] B edits collide"], {
+    parallel: { workers: 2, merge: "auto" },
+  });
+  gitInitProject(p);
+  const { code, out } = await runCli(p.root, []);
+  assert.equal(code, 0, `退出码非 0\n${out}`);
+
+  const j = journalText(p.root);
+  assert.match(j, /"type":"merge_conflict"/, "两个任务改同一文件，应出现一次合并冲突");
+  assert.match(j, /"type":"merge_ok"/, "先完成的那个应成功合并");
+  // 任务本身都成功了（成果在分支上），TODO 全部打勾
+  const md = fs.readFileSync(p.todoPath, "utf8");
+  assert.match(md, /\[x\] \[clash\] A/);
+  assert.match(md, /\[x\] \[clash\] B/);
+  // 冲突分支和 worktree 被保留
+  const branches = git(p.root, ["branch", "--list", "argus/*"]).trim();
+  assert.notEqual(branches, "", "冲突分支应保留");
+  // 晨报包含待人工合并区块
+  const reportsDir = path.join(p.root, ".argus", "reports");
+  const report = fs.readFileSync(path.join(reportsDir, fs.readdirSync(reportsDir)[0]), "utf8");
+  assert.match(report, /待人工合并/);
+});
+
+test("e2e 并行: 脏工作区直接拒绝启动", { timeout: 120_000 }, async () => {
+  cleanFakeState();
+  const p = makeProject(["[p] whatever"], { parallel: { workers: 2, merge: "auto" } });
+  gitInitProject(p);
+  // 制造 tracked 脏文件
+  fs.writeFileSync(path.join(p.root, "dirty.txt"), "uncommitted\n");
+  git(p.root, ["add", "dirty.txt"]);
+  const { code, out } = await runCli(p.root, []);
+  assert.equal(code, 1, `应拒绝启动\n${out}`);
+  assert.match(out, /工作区干净/);
+  assert.doesNotMatch(fs.readFileSync(p.todoPath, "utf8"), /\[x\]/);
 });
 
 test("e2e: --prompt 单条任务模式 + 花费入账", async () => {

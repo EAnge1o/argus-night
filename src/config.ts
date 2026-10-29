@@ -26,6 +26,7 @@ export interface ArgusConfig {
   };
   onTaskFail: "retry-then-next" | "skip" | "abort";
   taskRetries: number;
+  parallel: { workers: number; merge: "auto" | "leave" };
   git: { autoCommit: boolean; commitMessagePrefix: string };
   fsHeartbeat: boolean;
   fsHeartbeatExclude: string[];
@@ -67,6 +68,7 @@ export const DEFAULT_CONFIG: ArgusConfig = {
   stop: { until: null, maxHours: 12, maxCostUsd: null, maxRestarts: 200 },
   onTaskFail: "retry-then-next",
   taskRetries: 2,
+  parallel: { workers: 1, merge: "auto" },
   git: { autoCommit: false, commitMessagePrefix: "argus:" },
   fsHeartbeat: true,
   fsHeartbeatExclude: [],
@@ -167,6 +169,16 @@ export function validateConfig(cfg: ArgusConfig): void {
   );
   expect(cfg.taskRetries >= 0, "taskRetries 必须 >= 0");
   expect(
+    Number.isInteger(cfg.parallel.workers) &&
+      cfg.parallel.workers >= 1 &&
+      cfg.parallel.workers <= 8,
+    "parallel.workers 必须是 1–8 的整数（1 = 顺序模式）",
+  );
+  expect(
+    cfg.parallel.merge === "auto" || cfg.parallel.merge === "leave",
+    `parallel.merge 必须是 auto / leave，当前为 "${cfg.parallel.merge}"`,
+  );
+  expect(
     cfg.onTaskFail === "retry-then-next" ||
       cfg.onTaskFail === "skip" ||
       cfg.onTaskFail === "abort",
@@ -257,6 +269,12 @@ export function starterConfigText(): string {
   // 单个任务连续失败后的策略：retry-then-next（重试后跳过）/ skip / abort
   "onTaskFail": "retry-then-next",
   "taskRetries": 2,
+
+  // 并行模式：N 个 worker 各自在一个独立 git worktree 里领任务，互不踩脚
+  // workers: 1 = 顺序（默认）。并行要求：当前目录是干净的 git 仓库且有提交。
+  // merge: "auto" = 任务成功后自动提交并合并回主分支（冲突则保留分支待人工）；
+  //        "leave" = 只干活不合并，所有分支留给早上人工审查（Claude Squad 风格）
+  "parallel": { "workers": 1, "merge": "auto" },
 
   // 每个任务完成后自动 git commit（强烈建议开着 git，这是无人值守的安全网）
   "git": { "autoCommit": false, "commitMessagePrefix": "argus:" },

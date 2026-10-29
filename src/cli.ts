@@ -6,7 +6,7 @@ import { cmdDoctor } from "./commands/doctor.js";
 import { cmdInit } from "./commands/init.js";
 import { ArgusError } from "./util.js";
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 
 const USAGE = `
 🌙 Argus — coding agent 守夜人 v${VERSION}
@@ -30,6 +30,8 @@ run 选项:
   --max-cost <usd>     花费上限（美元，claude 适配器）
   --max-restarts <n>   重启次数上限
   --idle-minutes <n>   看门狗无活动阈值（分钟）
+  --parallel <n>       并行 worker 数（1–8）：每个 worker 一个 git worktree 隔离，
+                       任务成功自动合并回主分支，冲突保留分支待人工
   --wrap-up            收工前让 agent 提交代码并写总结
   --dry-run            只打印将执行的命令，不真正启动
   --verbose            透传 agent 全部输出
@@ -114,6 +116,7 @@ async function main(): Promise<number> {
         maxCost: str(flags, "max-cost"),
         maxRestarts: str(flags, "max-restarts"),
         idleMinutes: str(flags, "idle-minutes"),
+        parallel: str(flags, "parallel"),
         verbose: bool(flags, "verbose") === true,
         dryRun: bool(flags, "dry-run") === true,
         wrapUp: bool(flags, "wrap-up"),

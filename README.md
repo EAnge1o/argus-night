@@ -101,6 +101,22 @@ npx argus-night run --prompt "把 src 下所有 any 类型修掉并跑通测试"
 
 **断点层**：`.argus/journal-*.jsonl` 记录每一次 spawn / 杀进程 / 配额等待 / 退避 / 成本；TODO.md 本身就是断点——完成打勾、失败留白，下次 `argus run` 自动接着干。
 
+## 并行模式（worktree 隔离）
+
+```bash
+argus run --parallel 3 --until 07:00
+# 或配置文件里 "parallel": { "workers": 3, "merge": "auto" }
+```
+
+3 个 worker 同时开工，每个 worker 在**独立的 git worktree**（`.argus/worktrees/wN`，分支 `argus/<runId>/wN`）里从共享队列领任务——互不踩脚，也不污染你的主工作区。
+
+- **前置条件**：干净的 git 仓库（有 tracked 未提交修改会直接拒绝启动）且至少一次提交；有 git 提交身份（自动合并会创建 merge commit）。
+- **成功即合并**：任务成功 → worktree 内自动提交 → 勾选 TODO.md 并提交 → 合并回主分支 → worker 分支 fast-forward 到最新主干继续领下一个任务（node_modules 等 ignored 文件原样保留，不用重装依赖）。
+- **冲突不硬啃**：两个 worker 改了同一个文件，先到的自动合并，后到的**保留分支和 worktree**，晨报里列出分支名和路径，早上人工处理。任务本身仍算成功——成果已经在分支上。
+- **`merge: "leave"`**：全部不合并，所有分支留给早上人工审查（Claude Squad 风格）。
+- **配额/看门狗互不连坐**：一个 worker 在配额睡眠，其他 worker 照常干活；SIGINT 一次优雅杀掉全部 worker。
+- 上限 8 个 worker——订阅配额就那么多，并行省的是串行等待，不是 token。
+
 ## 命令参考
 
 | 命令 | 作用 |
@@ -111,7 +127,7 @@ npx argus-night run --prompt "把 src 下所有 any 类型修掉并跑通测试"
 | `argus report [--rebuild]` | 打印最近一次晨报 |
 | `argus doctor [--probe]` | 守夜前体检；`--probe` 真实调用一次 agent 验证整条链路 |
 
-`run` 常用选项：`--task <file>`、`--prompt <text>`、`--agent claude|codex|custom`、`--until HH:MM`、`--max-hours <n>`、`--max-cost <usd>`、`--max-restarts <n>`、`--idle-minutes <n>`、`--wrap-up`、`--dry-run`、`--verbose`、`--no-fs-heartbeat`。
+`run` 常用选项：`--task <file>`、`--prompt <text>`、`--agent claude|codex|custom`、`--parallel 1-8`、`--until HH:MM`、`--max-hours <n>`、`--max-cost <usd>`、`--max-restarts <n>`、`--idle-minutes <n>`、`--wrap-up`、`--dry-run`、`--verbose`、`--no-fs-heartbeat`。
 
 ## 配置
 
@@ -145,12 +161,12 @@ npm install
 npm test        # 26 个测试：单元 + 端到端
 ```
 
-端到端测试用 `test/fixtures/fake-agent.mjs` 模拟真实 agent 的全部死法，逐条验证：配额触发→睡眠→同会话续跑→打勾→晨报；挂死→看门狗整树清理（断言父子进程确实死亡）；429→退避→续跑；永久失败→按策略跳过不阻塞后续任务。架构细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+端到端测试用 `test/fixtures/fake-agent.mjs` 模拟真实 agent 的全部死法，逐条验证：配额触发→睡眠→同会话续跑→打勾→晨报；挂死→看门狗整树清理（断言父子进程确实死亡）；429→退避→续跑；永久失败→按策略跳过不阻塞后续任务；并行模式→worktree 隔离、自动合并回主分支、同文件冲突保留分支待人工、脏工作区拒绝启动。架构细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## Roadmap
 
+- [x] 多 agent 并行（worktree 隔离，自动合并 / 冲突保留）— v1.1.0
 - [ ] `argus tui` 全屏仪表盘
-- [ ] 多 agent 并行（每个任务一个 worktree，Claude Squad 风格）
 - [ ] Codex 适配器的成本解析（codex --json 成本字段稳定后）
 - [ ] 晨报推送邮件 / Telegram
 - [ ] 配额日历：按历史消耗预测今晚能跑几个任务

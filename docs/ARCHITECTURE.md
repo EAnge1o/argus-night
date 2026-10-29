@@ -51,6 +51,32 @@ runTask(task)
 
 6. **失败分级**：config_error（参数不认识）是用户错误，立即中止不烧钱；quota 是正常节奏，睡；api_busy 是暂态，退避；hang 是进程病，杀；task fail 是业务病，按 `onTaskFail` 策略跳过/重试/中止。四种病四种药，不会用重试去修配置错误。
 
+## 并行模式的状态机（v1.1.0）
+
+```
+runParallel
+  ├─ assertParallelReady(): 干净仓库 + 有提交 + git 身份，否则拒绝启动
+  ├─ create() × N: git worktree add -b argus/<runId>/wN  (基于当前 HEAD)
+  └─ N × workerLoop（async 并发，单进程内共享 queue/journal/stop 条件）
+       循环:
+         stopChecks() → 中断/收工点/花费/重启上限 → 退出
+         queue.shift() 领任务 → journal.task_claim {worker}
+         runTask(task)  ← 同顺序状态机，cwd = worktree
+         成功:
+           commitWork(wt)            worktree 内提交 agent 产出
+           markTodoDone + commitCheckpoints(主区)   勾选并提交，保证 merge 时主区干净
+           mergeToMain(wt)           merge 成功 → wt 分支 reset --hard 主分支尖端
+                                     （node_modules 等 ignored 文件原地保留）
+                                     冲突 → merge --abort，分支/worktree 保留 → merge_conflict
+       收尾: cleanupAll → 已合并的 worktree 移除 + 分支 -d；未合并的全部保留待人工
+```
+
+设计要点：
+- **worktree 不随任务销毁**，合并成功后 reset 到新主干复用——真实项目里重装 node_modules 是不可接受的。
+- **勾选先于合并**：TODO.md 的 checkbox 修改先在主区提交，否则 merge 会撞上脏工作区。
+- JS 单线程保证了共享队列与 TODO.md 标记没有真并发；agent 进程是真并发，靠 worktree 隔离。
+- `merge: "leave"` 时跳过全部合并步骤，worker 只干活，分支留给早上。
+
 ## Windows 专项
 
 - `resolveCommand()`：`where` 全量候选按 `.cmd/.bat > .exe > 其他` 排序，避开 npm 生产的 sh 脚本 shim。

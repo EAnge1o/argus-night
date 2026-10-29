@@ -6,8 +6,9 @@ import { Journal, type TaskState } from "../journal.js";
 import { Logger } from "../log.js";
 import { Notifier } from "../notify.js";
 import { AgentRunner, adapterCommandExists } from "../runner.js";
-import { markTaskLine, parseTaskList, remainingTasks } from "../tasks.js";
+import { markTaskLine, parseTaskList, remainingTasks, type TaskItem } from "../tasks.js";
 import { writeReport } from "../report.js";
+import { WorktreeManager, type Worktree } from "../worktree.js";
 import { ArgusError, fmtDur, nextWallClock, truncate } from "../util.js";
 
 export interface RunFlags {
@@ -19,6 +20,7 @@ export interface RunFlags {
   maxCost?: string;
   maxRestarts?: string;
   idleMinutes?: string;
+  parallel?: string;
   verbose?: boolean;
   dryRun?: boolean;
   wrapUp?: boolean;
@@ -34,6 +36,11 @@ function applyOverrides(base: ArgusConfig, flags: RunFlags): ArgusConfig {
     const v = Number(flags.idleMinutes);
     if (!Number.isFinite(v) || v < 0.1) throw new ArgusError("--idle-minutes 必须 >= 0.1");
     cfg.idleTimeoutMinutes = v;
+  }
+  if (flags.parallel) {
+    const v = Number(flags.parallel);
+    if (!Number.isInteger(v) || v < 1 || v > 8) throw new ArgusError("--parallel 必须是 1–8 的整数");
+    cfg.parallel.workers = v;
   }
   if (flags.until) {
     if (flags.until.toLowerCase() === "never") cfg.stop.until = null;
@@ -83,6 +90,258 @@ function gitAutoCommit(root: string, cfg: ArgusConfig, taskText: string, log: Lo
   }
 }
 
+interface ScopeDeps {
+  root: string;
+  cfg: ArgusConfig;
+  journal: Journal;
+  log: Logger;
+  notify: Notifier;
+  stopAt: Date | null;
+  interrupted: () => boolean;
+  dryRun: boolean;
+  fileTasks: { text: string; line: number }[];
+  activeRunners: AgentRunner[];
+  /** set to true when onTaskFail=abort should stop every worker */
+  abort: { requested: boolean };
+  stopReason: { value: string };
+  done: { count: number };
+  failed: { count: number };
+}
+
+function setStopReason(box: { value: string }, reason: string): void {
+  // First reason wins; the default "全部任务完成" is replaced by whatever ends the run.
+  if (box.value === "全部任务完成") box.value = reason;
+}
+
+function stopChecks(deps: ScopeDeps, cfg: ArgusConfig): string | null {
+  if (deps.interrupted()) return "手动中断";
+  if (deps.abort.requested) return "任务失败（onTaskFail=abort）";
+  if (deps.stopAt && Date.now() >= deps.stopAt.getTime()) return "到达收工时间";
+  if (cfg.stop.maxCostUsd != null && deps.journal.totals.costUsd >= cfg.stop.maxCostUsd) return "花费达到上限";
+  if (cfg.stop.maxRestarts > 0 && deps.journal.totals.restarts >= cfg.stop.maxRestarts) return "重启次数达到上限";
+  return null;
+}
+
+/** Make a runner for a given working directory and register it for SIGINT kills. */
+function makeRunner(deps: ScopeDeps, cwd: string, workerId: number | undefined, dryRun: boolean): AgentRunner {
+  const runner = new AgentRunner({
+    cfg: deps.cfg,
+    journal: deps.journal,
+    log: deps.log,
+    notify: deps.notify,
+    dryRun,
+    stopAt: deps.stopAt,
+    onInterrupted: deps.interrupted,
+    cwd,
+    workerId,
+  });
+  deps.activeRunners.push(runner);
+  return runner;
+}
+
+async function finishTaskRound(
+  deps: ScopeDeps,
+  taskText: string,
+  st: TaskState,
+  runner: AgentRunner,
+): Promise<{ kind: "success" | "failed" | "stop_time"; reason?: string; attempts: number; sessionId: string | null; costUsd: number | null }> {
+  const { cfg, journal, log, notify } = deps;
+  let outcome = await runner.runTask(taskText, st);
+  let round = 0;
+  while (outcome.kind === "failed" && cfg.onTaskFail === "retry-then-next" && round < cfg.taskRetries) {
+    round += 1;
+    log.warn(`任务失败，整任务重试（第 ${round}/${cfg.taskRetries} 轮，使用全新会话）…`);
+    journal.updateTask(taskText, { sessionId: null });
+    st.sessionId = null;
+    outcome = await runner.runTask(taskText, st);
+  }
+  if (outcome.kind === "stop_time") return { kind: "stop_time", attempts: 0, sessionId: null, costUsd: null };
+  if (outcome.kind === "success") {
+    journal.append("task_done", {
+      task: taskText,
+      attempts: outcome.attempts,
+      costUsd: outcome.costUsd,
+      ...(runner.workerId != null ? { worker: runner.workerId } : {}),
+    });
+    return { kind: "success", attempts: outcome.attempts, sessionId: outcome.sessionId, costUsd: outcome.costUsd };
+  }
+  journal.append("task_failed", { task: taskText, reason: outcome.reason });
+  journal.updateTask(taskText, { status: "failed", lastError: outcome.reason });
+  return { kind: "failed", reason: outcome.reason, attempts: outcome.attempts, sessionId: null, costUsd: null };
+}
+
+function markTodoDone(root: string, taskFile: string, taskText: string, log: Logger): void {
+  const taskPath = path.join(root, taskFile);
+  try {
+    const md = fs.readFileSync(taskPath, "utf8");
+    const item: TaskItem | undefined = parseTaskList(md).find((t) => t.text === taskText && !t.done);
+    if (!item) {
+      log.debug(`任务清单中未找到可勾选行: ${truncate(taskText, 40)}`);
+      return;
+    }
+    fs.writeFileSync(taskPath, markTaskLine(md, item.line, "x"));
+  } catch {
+    /* task file is the checkpoint, but never crash the run over it */
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Sequential scope (workers = 1) — original behavior, unchanged       */
+/* ------------------------------------------------------------------ */
+
+async function runSequential(deps: ScopeDeps, prompt: string | undefined): Promise<void> {
+  const { cfg, journal, log, notify, root } = deps;
+  const runner = makeRunner(deps, root, undefined, Boolean(deps.dryRun));
+  const tasks: { text: string; line?: number }[] = prompt ? [{ text: prompt }] : deps.fileTasks;
+
+  if (deps.dryRun) {
+    log.event("[dry-run] 只打印计划，不会真的启动 agent");
+    for (const t of tasks) {
+      log.info(`→ ${truncate(t.text, 70)}`);
+      log.info(`   ${runner.describePlan(t.text, "fresh", null)}`);
+    }
+    return;
+  }
+
+  for (const [idx, task] of tasks.entries()) {
+    const stop = stopChecks(deps, cfg);
+    if (stop) {
+      setStopReason(deps.stopReason, stop);
+      return;
+    }
+
+    journal.setCurrentTask(task.text);
+    log.event(`▶ 任务 ${idx + 1}/${tasks.length}: ${truncate(task.text, 90)}`);
+    const st: TaskState = journal.taskState(task.text);
+    const res = await finishTaskRound(deps, task.text, st, runner);
+
+    if (res.kind === "stop_time") {
+      setStopReason(deps.stopReason, deps.interrupted() ? "手动中断" : "到达收工时间");
+      return;
+    }
+    if (res.kind === "success") {
+      deps.done.count += 1;
+      log.event(`✅ 完成: ${truncate(task.text, 80)}`);
+      notify.send("task_done", "✅ 任务完成", truncate(task.text, 80));
+      if (task.line != null) markTodoDone(root, cfg.taskFile, task.text, log);
+      gitAutoCommit(root, cfg, task.text, log);
+    } else {
+      deps.failed.count += 1;
+      log.error(`✗ 任务失败: ${truncate(task.text, 70)} — ${res.reason}`);
+      notify.send("task_failed", "❌ 任务失败", `${truncate(task.text, 70)}\n${res.reason}`);
+      if (cfg.onTaskFail === "abort") {
+        deps.abort.requested = true;
+        setStopReason(deps.stopReason, "任务失败（onTaskFail=abort）");
+        return;
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Parallel scope — N workers, one git worktree each                   */
+/* ------------------------------------------------------------------ */
+
+async function runParallel(deps: ScopeDeps): Promise<void> {
+  const { cfg, journal, log, notify, root } = deps;
+  const manager = new WorktreeManager(root);
+  manager.assertParallelReady();
+  const workerCount = cfg.parallel.workers;
+
+  log.event(
+    `🔀 并行模式：${workerCount} 个 worker × 独立 worktree · 合并策略 ${cfg.parallel.merge === "auto" ? "auto（成功即合并）" : "leave（全部留分支待审查）"}`,
+  );
+
+  // Dedupe by text (duplicate checklist lines would be claimed twice).
+  const seen = new Set<string>();
+  const queue = deps.fileTasks.filter((t) => (seen.has(t.text) ? false : (seen.add(t.text), true)));
+
+  const worktrees: Worktree[] = [];
+  for (let i = 0; i < workerCount; i++) {
+    worktrees.push(manager.create(i, deps.journal.runId));
+  }
+
+  const workerStatus: { id: number; task: string | null }[] = worktrees.map((wt) => ({ id: wt.id, task: null }));
+  const publishWorkers = () => journal.setStatusExtra({ workers: workerStatus.map((w) => ({ ...w })) });
+
+  const workerLoop = async (wt: Worktree): Promise<void> => {
+    const runner = makeRunner(deps, wt.path, wt.id, false);
+    const label = `w${wt.id}`;
+
+    for (;;) {
+      const stop = stopChecks(deps, cfg);
+      if (stop) {
+        setStopReason(deps.stopReason, stop);
+        return;
+      }
+      const task = queue.shift();
+      if (!task) return;
+      workerStatus[wt.id].task = truncate(task.text, 40);
+      publishWorkers();
+      journal.append("task_claim", { task: task.text, worker: wt.id });
+      log.event(`▶ [${label}] ${truncate(task.text, 84)}`);
+      const st: TaskState = journal.taskState(task.text);
+      const res = await finishTaskRound(deps, task.text, st, runner);
+      workerStatus[wt.id].task = null;
+      publishWorkers();
+
+      if (res.kind === "stop_time") {
+        setStopReason(deps.stopReason, deps.interrupted() ? "手动中断" : "到达收工时间");
+        return;
+      }
+      if (res.kind === "success") {
+        deps.done.count += 1;
+        log.event(`✅ [${label}] 完成: ${truncate(task.text, 74)}`);
+        notify.send("task_done", "✅ 任务完成", `[${label}] ${truncate(task.text, 80)}`);
+        // Tick the checklist first and commit it, so the merge never meets a dirty main.
+        markTodoDone(root, cfg.taskFile, task.text, log);
+        if (cfg.parallel.merge === "auto") {
+          try {
+            manager.commitWork(wt, `${cfg.git.commitMessagePrefix} ${task.text}`);
+            manager.commitCheckpoints(`${cfg.git.commitMessagePrefix} ✓ ${truncate(task.text, 50)}`);
+            const merged = manager.mergeToMain(wt);
+            if (merged === "merged") {
+              journal.append("merge_ok", { task: task.text, branch: wt.branch });
+            } else {
+              journal.append("merge_conflict", { task: task.text, branch: wt.branch, path: wt.path });
+              log.warn(`⚠ [${label}] 合并冲突：成果在分支 ${wt.branch}（worktree: ${wt.path}），留给早上人工处理`);
+            }
+          } catch (e) {
+            journal.append("merge_error", { task: task.text, branch: wt.branch, error: String(e) });
+            log.warn(`⚠ [${label}] 合并失败（成果保留在分支 ${wt.branch}）: ${truncate(String(e), 100)}`);
+          }
+        }
+      } else {
+        deps.failed.count += 1;
+        log.error(`✗ [${label}] 任务失败: ${truncate(task.text, 70)} — ${res.reason}`);
+        notify.send("task_failed", "❌ 任务失败", `[${label}] ${truncate(task.text, 70)}\n${res.reason}`);
+        if (cfg.onTaskFail === "abort") {
+          deps.abort.requested = true;
+          setStopReason(deps.stopReason, "任务失败（onTaskFail=abort）");
+          return;
+        }
+      }
+    }
+  };
+
+  try {
+    await Promise.all(worktrees.map((wt) => workerLoop(wt)));
+  } finally {
+    const leftover = manager.cleanupAll(worktrees);
+    if (leftover.length) {
+      log.warn(`📦 ${leftover.length} 个未合并的 worker 分支已保留：`);
+      for (const wt of leftover) {
+        log.warn(`   ${wt.branch} → ${wt.path}`);
+      }
+      journal.setStatusExtra({ leftoverBranches: leftover.map((wt) => wt.branch) });
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* cmdRun — shared setup, scope dispatch, wrap-up, report              */
+/* ------------------------------------------------------------------ */
+
 export async function cmdRun(root: string, flags: RunFlags): Promise<number> {
   const { config: baseCfg } = loadConfig(root);
   const cfg = applyOverrides(baseCfg, flags);
@@ -110,10 +369,15 @@ export async function cmdRun(root: string, flags: RunFlags): Promise<number> {
   if (cfg.stop.maxRestarts > 0) deadlines.push(`重启上限 ${cfg.stop.maxRestarts} 次`);
 
   log.event(`🌙 Argus 开始夜间值守 — run ${runId}`);
-  log.info(`agent: ${cfg.agent} · 任务清单: ${flags.prompt ? "（单条任务模式）" : cfg.taskFile}`);
+  log.info(
+    `agent: ${cfg.agent} · 任务清单: ${flags.prompt ? "（单条任务模式）" : cfg.taskFile} · worker: ${cfg.parallel.workers}`,
+  );
   log.info(`收工条件: ${deadlines.length ? deadlines.join(" · ") : "全部任务完成"}`);
   if (cfg.permissions === "bypass" && cfg.agent === "claude") {
     log.warn("已启用 --dangerously-skip-permissions：agent 可以不经确认执行任何命令。建议在容器/虚拟机中运行，并确保 git 仓库干净可回滚。");
+  }
+  if (cfg.parallel.workers > 1 && cfg.permissions === "bypass") {
+    log.warn(`并行 ×${cfg.parallel.workers}：${cfg.parallel.workers} 个 agent 同时持有人 jar 权限在工作，确认任务清单里没有会互相踩踏的任务。`);
   }
 
   // Preflight
@@ -132,7 +396,7 @@ export async function cmdRun(root: string, flags: RunFlags): Promise<number> {
   }
 
   // Collect tasks
-  const fileTasks: { text: string; line: number }[] = [];
+  let fileTasks: { text: string; line: number }[] = [];
   if (flags.prompt) {
     log.info(`单条任务: ${truncate(flags.prompt, 90)}`);
   } else {
@@ -145,7 +409,7 @@ export async function cmdRun(root: string, flags: RunFlags): Promise<number> {
       );
     }
     const md = fs.readFileSync(taskPath, "utf8");
-    fileTasks.push(...remainingTasks(md).map((t) => ({ text: t.text, line: t.line })));
+    fileTasks = remainingTasks(md).map((t) => ({ text: t.text, line: t.line }));
     if (fileTasks.length === 0) {
       log.event("✅ 任务清单里没有未完成事项，无事可守。晚安！");
       journal.finish();
@@ -157,154 +421,93 @@ export async function cmdRun(root: string, flags: RunFlags): Promise<number> {
     log.info(`待执行 ${fileTasks.length} 个任务`);
   }
 
-  let interrupted = false;
-  const runner = new AgentRunner({
+  if (cfg.parallel.workers > 1 && flags.prompt) {
+    log.close();
+    throw new ArgusError(
+      "--prompt 单条任务模式不支持并行（只有一条任务，没有队列可分）",
+      "把任务写进 TODO.md 清单后用 argus run --parallel N",
+    );
+  }
+
+  const interrupted = { flag: false };
+  const deps: ScopeDeps = {
+    root,
     cfg,
     journal,
     log,
     notify,
-    dryRun: Boolean(flags.dryRun),
     stopAt,
-    onInterrupted: () => interrupted,
-  });
+    interrupted: () => interrupted.flag,
+    dryRun: Boolean(flags.dryRun),
+    fileTasks,
+    activeRunners: [],
+    abort: { requested: false },
+    stopReason: { value: "全部任务完成" },
+    done: { count: 0 },
+    failed: { count: 0 },
+  };
 
-  process.on("SIGINT", () => {
-    if (!interrupted) {
-      interrupted = true;
+  const onSigint = () => {
+    if (!interrupted.flag) {
+      interrupted.flag = true;
       log.warn("收到 Ctrl+C：正在优雅收尾，等待当前进程退出（再按一次强制退出）…");
-      runner.killCurrent();
+      for (const r of deps.activeRunners) r.killCurrent();
     } else {
       log.error("强制退出");
       process.exit(130);
     }
-  });
+  };
+  process.on("SIGINT", onSigint);
 
-  if (flags.dryRun) {
-    log.event("[dry-run] 只打印计划，不会真的启动 agent");
-    if (flags.prompt) {
-      log.info(`→ ${runner.describePlan(flags.prompt, "fresh", null)}`);
-    } else {
-      for (const t of fileTasks) {
-        log.info(`→ ${truncate(t.text, 70)}`);
-        log.info(`   ${runner.describePlan(t.text, "fresh", null)}`);
-      }
-    }
-    log.close();
-    return 0;
-  }
-
-  const totalTasks = flags.prompt ? 1 : fileTasks.length;
-  let done = 0;
-  let failed = 0;
-  let stopReason = "全部任务完成";
   const statusTimer = setInterval(() => {
     const t = journal.totals;
     log.setStatus(
-      `🌙 值守中 · ✅${done}/${totalTasks} · 重启 ${t.restarts} · 看门狗 ${t.hangKills} · 配额等待 ${fmtDur(t.quotaSleepMs)}${t.costUsd > 0 ? ` · $${t.costUsd.toFixed(2)}` : ""}`,
+      `🌙 值守中 · ✅${deps.done.count}/${fileTasks.length || 1} · 重启 ${t.restarts} · 看门狗 ${t.hangKills} · 配额等待 ${fmtDur(t.quotaSleepMs)}${t.costUsd > 0 ? ` · $${t.costUsd.toFixed(2)}` : ""}`,
     );
-    journal.setStatusExtra({ progress: `${done}/${totalTasks}` });
+    journal.setStatusExtra({ progress: `${deps.done.count}/${fileTasks.length || 1}` });
   }, 5000);
 
   try {
-    const tasks: { text: string; line?: number }[] = flags.prompt
-      ? [{ text: flags.prompt }]
-      : fileTasks;
-
-    for (const [idx, task] of tasks.entries()) {
-      // Stop conditions are checked BETWEEN tasks; the running one finishes.
-      if (interrupted) {
-        stopReason = "手动中断";
-        break;
-      }
-      if (stopAt && Date.now() >= stopAt.getTime()) {
-        stopReason = "到达收工时间";
-        break;
-      }
-      if (cfg.stop.maxCostUsd != null && journal.totals.costUsd >= cfg.stop.maxCostUsd) {
-        stopReason = "花费达到上限";
-        break;
-      }
-      if (cfg.stop.maxRestarts > 0 && journal.totals.restarts >= cfg.stop.maxRestarts) {
-        stopReason = "重启次数达到上限";
-        break;
-      }
-
-      journal.setCurrentTask(task.text);
-      log.event(`▶ 任务 ${idx + 1}/${tasks.length}: ${truncate(task.text, 90)}`);
-      const st: TaskState = journal.taskState(task.text);
-
-      let outcome = await runner.runTask(task.text, st);
-      // Task-level retry rounds (each round re-enters the restart state machine).
-      let round = 0;
-      while (outcome.kind === "failed" && cfg.onTaskFail === "retry-then-next" && round < cfg.taskRetries) {
-        round += 1;
-        log.warn(`任务失败，整任务重试（第 ${round}/${cfg.taskRetries} 轮，使用全新会话）…`);
-        journal.updateTask(task.text, { sessionId: null });
-        st.sessionId = null;
-        outcome = await runner.runTask(task.text, st);
-      }
-
-      if (outcome.kind === "stop_time") {
-        stopReason = interrupted ? "手动中断" : "到达收工时间";
-        break;
-      }
-      if (outcome.kind === "success") {
-        done += 1;
-        journal.append("task_done", { task: task.text, attempts: outcome.attempts, costUsd: outcome.costUsd });
-        log.event(`✅ 完成: ${truncate(task.text, 80)}`);
-        notify.send("task_done", "✅ 任务完成", truncate(task.text, 80));
-        if (task.line != null) {
-          const taskPath = path.join(root, cfg.taskFile);
-          const md = fs.readFileSync(taskPath, "utf8");
-          fs.writeFileSync(taskPath, markTaskLine(md, task.line, "x"));
-          // Re-map line numbers for subsequent tasks after rewriting the file.
-          const refreshed = parseTaskList(fs.readFileSync(taskPath, "utf8"));
-          for (const later of tasks.slice(idx + 1)) {
-            if (later.line == null) continue;
-            const found = refreshed.find((r) => r.text === later.text && !r.done);
-            if (found) later.line = found.line;
-          }
+    if (cfg.parallel.workers > 1 && !flags.prompt) {
+      if (flags.dryRun) {
+        log.event("[dry-run] 并行模式预演：将创建 " + cfg.parallel.workers + " 个 worktree");
+        const probeRunner = makeRunner(deps, root, undefined, true);
+        for (const t of fileTasks) {
+          log.info(`→ ${truncate(t.text, 70)}`);
+          log.info(`   ${probeRunner.describePlan(t.text, "fresh", null)}`);
         }
-        gitAutoCommit(root, cfg, task.text, log);
       } else {
-        failed += 1;
-        journal.append("task_failed", { task: task.text, reason: outcome.reason });
-        journal.updateTask(task.text, { status: "failed", lastError: outcome.reason });
-        log.error(`✗ 任务失败: ${truncate(task.text, 70)} — ${outcome.reason}`);
-        notify.send("task_failed", "❌ 任务失败", `${truncate(task.text, 70)}\n${outcome.reason}`);
-        // Task stays unchecked so the next run can retry it.
-        if (cfg.onTaskFail === "abort") {
-          stopReason = "任务失败（onTaskFail=abort）";
-          break;
-        }
+        await runParallel(deps);
       }
+    } else {
+      await runSequential(deps, flags.prompt);
     }
 
-    // Wrap-up: let the agent land the plane before dawn.
-    if (cfg.wrapUp && done + failed > 0 && !interrupted) {
+    // Wrap-up: let the agent land the plane before dawn (always in the main checkout).
+    if (cfg.wrapUp && deps.done.count + deps.failed.count > 0 && !flags.dryRun && !interrupted.flag) {
       log.event("🛬 收工指令：让 agent 提交代码并总结");
+      const wrapRunner = makeRunner(deps, root, undefined, false);
       const wrapSt = journal.taskState("(wrap-up)");
-      const wrapOutcome = await runner.runTask(cfg.wrapUpPrompt, wrapSt);
+      const wrapOutcome = await wrapRunner.runTask(cfg.wrapUpPrompt, wrapSt);
       if (wrapOutcome.kind === "success") {
         journal.append("task_done", { task: "(wrap-up)" });
-        if (cfg.agent !== "custom" || cfg.git.autoCommit) {
-          gitAutoCommit(root, cfg, "wrap-up", log);
-        }
+        gitAutoCommit(root, cfg, "wrap-up", log);
       }
     }
   } finally {
     clearInterval(statusTimer);
+    process.removeListener("SIGINT", onSigint);
     journal.finish();
-    const reportPath = writeReport(root, cfg, journal, { stopReason, startCommit });
+    const reportPath = writeReport(root, cfg, journal, { stopReason: deps.stopReason.value, startCommit });
     log.setStatus(null);
-    log.event(`📜 值守结束：${stopReason} · ✅${done} ❌${failed}`);
+    log.event(`📜 值守结束：${deps.stopReason.value} · ✅${deps.done.count} ❌${deps.failed.count}`);
     log.info(`📄 晨报已生成: ${reportPath}`);
     notify.send(
       "run_end",
       "📜 Argus 值守结束",
-      `${stopReason}\n完成 ${done} · 失败 ${failed} · 重启 ${journal.totals.restarts} · 配额等待 ${fmtDur(journal.totals.quotaSleepMs)}${journal.totals.costUsd > 0 ? ` · 花费 $${journal.totals.costUsd.toFixed(2)}` : ""}\n晨报: ${reportPath}`,
+      `${deps.stopReason.value}\n完成 ${deps.done.count} · 失败 ${deps.failed.count} · 重启 ${journal.totals.restarts} · 配额等待 ${fmtDur(journal.totals.quotaSleepMs)}${journal.totals.costUsd > 0 ? ` · 花费 $${journal.totals.costUsd.toFixed(2)}` : ""}\n晨报: ${reportPath}`,
     );
     log.close();
   }
-  return failed > 0 && cfg.onTaskFail === "abort" ? 1 : 0;
+  return deps.failed.count > 0 && cfg.onTaskFail === "abort" ? 1 : 0;
 }
