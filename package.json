@@ -1,0 +1,39 @@
+{
+  "name": "argus-night",
+  "version": "1.0.0",
+  "description": "Argus — the night watchman for coding agents: unattended overnight runs with quota-aware resume, a heartbeat watchdog, exponential backoff, and a morning report.",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "bin": {
+    "argus": "dist/src/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run -s build && node --test dist/test/patterns.test.js dist/test/backoff.test.js dist/test/config.test.js dist/test/e2e.test.js",
+    "cli": "node dist/src/cli.js"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "ai-agent",
+    "automation",
+    "watchdog",
+    "unattended",
+    "overnight",
+    "auto-resume",
+    "rate-limit",
+    "ralph"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4"
+  }
+}
