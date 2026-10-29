@@ -166,8 +166,11 @@ function git(root: string, args: string[]): string {
 function gitInitProject(p: Project): void {
   fs.writeFileSync(path.join(p.root, ".gitignore"), ".argus/\nnode_modules/\n");
   git(p.root, ["init", "-b", "main"]);
+  // 写进仓库本地配置：CI runner 没有全局 git 身份，而并行模式会校验它
+  git(p.root, ["config", "user.name", "test"]);
+  git(p.root, ["config", "user.email", "test@test.local"]);
   git(p.root, ["add", "-A"]);
-  git(p.root, ["-c", "user.name=t", "-c", "user.email=t@t.local", "commit", "-m", "init"]);
+  git(p.root, ["commit", "-m", "init"]);
 }
 
 test("e2e 并行: 2 worker × 4 任务，worktree 隔离、自动合并、配额不阻塞其他 worker", { timeout: 240_000 }, async () => {
