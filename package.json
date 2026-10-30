@@ -1,7 +1,16 @@
 {
   "name": "argus-night",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Argus — the night watchman for coding agents: unattended overnight runs with quota-aware resume, a heartbeat watchdog, exponential backoff, and a morning report.",
+  "author": "EAnge1o",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EAnge1o/argus-night.git"
+  },
+  "bugs": {
+    "url": "https://github.com/EAnge1o/argus-night/issues"
+  },
+  "homepage": "https://github.com/EAnge1o/argus-night#readme",
   "type": "module",
   "engines": {
     "node": ">=18.17"
@@ -16,7 +25,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run -s build && node --test dist/test/patterns.test.js dist/test/backoff.test.js dist/test/config.test.js dist/test/e2e.test.js",
+    "test": "npm run -s build && node --test dist/test/patterns.test.js dist/test/backoff.test.js dist/test/config.test.js dist/test/adapters.test.js dist/test/parallel.test.js dist/test/real-cli.test.js dist/test/e2e.test.js",
     "cli": "node dist/src/cli.js"
   },
   "keywords": [

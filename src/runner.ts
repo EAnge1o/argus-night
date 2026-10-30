@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import type { ArgusConfig } from "./config.js";
 import type { Journal, TaskState } from "./journal.js";
@@ -38,6 +38,8 @@ export interface RunnerDeps {
   /** Directory the agent runs in: the main checkout, or this worker's worktree. */
   cwd: string;
   workerId?: number;
+  /** 并行模式钩子：worker 进入/退出配额休眠时回调（用于雪崩检测） */
+  quotaSleepHook?: (asleep: boolean) => void;
 }
 
 const DEFAULT_EXCLUDES = [".git", "node_modules", ".argus"];
@@ -80,11 +82,14 @@ export class AgentRunner {
   async runTask(taskText: string, st: TaskState): Promise<TaskOutcome> {
     const { cfg, log, journal } = this.d;
     this.lastSessionId = null;
+    const priorAttempts = st.attempts;
     const backoff = new Backoff(cfg.backoff.baseSeconds * 1000, cfg.backoff.maxSeconds * 1000, cfg.backoff.factor);
     let mode: RunMode = st.sessionId ? "resume" : "fresh";
     let hangResumeLeft = cfg.hang.resumeTries;
     let hangFreshLeft = cfg.hang.freshTries;
     let attempts = 0;
+    let quotaStreak = 0;
+    let lastQuotaWakeAt: number | null = null;
 
     for (;;) {
       if (this.interrupted || this.d.onInterrupted()) {
@@ -96,7 +101,21 @@ export class AgentRunner {
       journal.append("spawn", { task: taskText, mode, attempt: attempts });
       journal.setPhase("running");
 
-      const outcome = await this.runProcess(taskText, mode, st.sessionId);
+      // New-session resume with a recap of what the previous incarnation did.
+      let promptText = taskText;
+      if (mode === "fresh" && cfg.freshSessionRecap && attempts + priorAttempts > 1) {
+        promptText = this.buildRecap(taskText, st);
+        log.info("已注入续跑 recap（上一次的进展摘要 + git 状态）");
+        journal.append("recap_injected", { task: taskText, attempt: attempts });
+      }
+
+      const outcome = await this.runProcess(taskText, promptText, mode, st.sessionId);
+
+      // 会话 id 在 init 行就能抓到：立即持久化，中途崩溃/限流后的续跑才有凭据
+      if (this.lastSessionId && !st.sessionId) {
+        st.sessionId = this.lastSessionId;
+        journal.updateTask(taskText, { sessionId: st.sessionId });
+      }
 
       if (outcome.configError) {
         journal.append("config_error", { task: taskText, matched: outcome.configError });
@@ -107,18 +126,35 @@ export class AgentRunner {
 
       // Subscription quota: sleep until reset, then resume the SAME session.
       if (outcome.quotaHit) {
-        const wake = resolveWakeTime(outcome.quotaHit.hint, cfg.quota.maxSleepMinutes * 60_000);
+        // Same task hitting quota again almost immediately = weekly/account limit.
+        // Escalate the sleep cap, then give up before burning the whole night.
+        const nowMs = Date.now();
+        quotaStreak = lastQuotaWakeAt != null && nowMs - lastQuotaWakeAt < 120_000 ? quotaStreak + 1 : 1;
+        if (quotaStreak >= 6) {
+          journal.append("quota_giveup", { task: taskText, streak: quotaStreak });
+          return { kind: "failed", reason: `配额连续 ${quotaStreak} 次触顶（疑似周限额或账户问题），放弃该任务`, attempts };
+        }
+        const capMs = quotaStreak >= 3 ? 24 * 3600_000 : cfg.quota.maxSleepMinutes * 60_000;
+        const wake = resolveWakeTime(outcome.quotaHit.hint, capMs);
         journal.append("quota_wait", {
           task: taskText,
           until: wake.toISOString(),
           matched: outcome.quotaHit.matched,
           hint: outcome.quotaHit.hint,
+          streak: quotaStreak,
         });
-        log.warn(`订阅配额触顶（匹配: "${truncate(outcome.quotaHit.matched, 60)}"），睡到 ${wake.toLocaleTimeString()} 后自动续跑`);
-        this.d.notify.send("quota", "🌙 配额休息", `任务「${truncate(taskText, 40)}」进入配额等待，预计 ${wake.toLocaleTimeString()} 恢复`);
+        log.warn(
+          `订阅配额触顶（第 ${quotaStreak} 次，匹配: "${truncate(outcome.quotaHit.matched, 50)}"），睡到 ${wake.toLocaleTimeString()} 后自动续跑`,
+        );
+        this.d.notify.send(
+          "quota",
+          "🌙 配额休息",
+          `任务「${truncate(taskText, 40)}」进入配额等待（连续第 ${quotaStreak} 次），预计 ${wake.toLocaleTimeString()} 恢复`,
+        );
         const napStart = Date.now();
         const woke = await this.sleepUntil(wake, "💤 配额休息");
         journal.addQuotaSleep(Date.now() - napStart);
+        lastQuotaWakeAt = Date.now();
         if (!woke) return { kind: "stop_time" };
         journal.updateTask(taskText, { quotaPauses: st.quotaPauses + 1 });
         mode = "resume";
@@ -220,7 +256,49 @@ export class AgentRunner {
 
   private lastSessionId: string | null = null;
 
-  private async runProcess(taskText: string, mode: RunMode, sessionId: string | null): Promise<ProcOutcome> {
+  private buildRecap(taskText: string, st: TaskState): string {
+    const events = this.d.journal
+      .events()
+      .filter(
+        (e) =>
+          e.task === taskText &&
+          ["watchdog_kill", "crash_backoff", "api_busy_backoff", "quota_wait", "quota_giveup"].includes(e.type),
+      )
+      .slice(-5);
+    let gitStatus = "";
+    try {
+      gitStatus = execFileSync("git", ["status", "--short"], {
+        cwd: this.d.cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch {
+      gitStatus = "";
+    }
+    const eventLines = events.map((e) => {
+      const detail =
+        e.reason != null
+          ? `: ${String(e.reason).slice(0, 80)}`
+          : e.exitCode != null
+            ? ` (exit ${e.exitCode})`
+            : e.until != null
+              ? ` → ${String(e.until).slice(11, 16)}`
+              : "";
+      return `- ${String(e.ts).slice(11, 19)} ${e.type}${detail}`;
+    });
+    return [
+      "[Argus 夜间值守 · 自动续跑]",
+      `这项任务此前已尝试 ${st.attempts} 次，前几次的 agent 进程异常终止或失败。最近的事件：`,
+      ...(eventLines.length ? eventLines : ["- （无详细事件）"]),
+      gitStatus
+        ? `git 工作区当前状态（可能留有上一任的未提交改动，请先检查）：\n${gitStatus}`
+        : "git 工作区当前没有未提交的改动。",
+      "请先用 git status / git diff / 查看相关文件确认已有进展，然后从中断处继续，不要重做已完成的部分。任务如下：",
+      taskText,
+    ].join("\n");
+  }
+
+  private async runProcess(taskText: string, promptText: string, mode: RunMode, sessionId: string | null): Promise<ProcOutcome> {
     const { cfg, log, journal } = this.d;
     const plan: SpawnPlan = planFor(this.adapter, { mode, sessionId, prompt: taskText });
     const startedAt = Date.now();
@@ -313,7 +391,7 @@ export class AgentRunner {
 
     // Prompt delivery: stdin avoids Windows cmd.exe quoting hell entirely.
     if (plan.promptVia === "stdin") {
-      child.stdin?.write(taskText + "\n");
+      child.stdin?.write(promptText + "\n");
       child.stdin?.end();
     }
 
@@ -389,20 +467,25 @@ export class AgentRunner {
   /** Sleep until a wall-clock deadline with a live countdown; false if the stop deadline cut it short. */
   private async sleepUntil(wake: Date, label: string): Promise<boolean> {
     const { log, journal } = this.d;
-    journal.setPhase("quota_sleep");
-    for (;;) {
-      const remain = wake.getTime() - Date.now();
-      if (remain <= 0) {
-        log.info("配额重置时间已到，恢复执行");
-        return true;
+    this.d.quotaSleepHook?.(true);
+    try {
+      journal.setPhase("quota_sleep");
+      for (;;) {
+        const remain = wake.getTime() - Date.now();
+        if (remain <= 0) {
+          log.info("配额重置时间已到，恢复执行");
+          return true;
+        }
+        if (this.d.stopAt && Date.now() + 30_000 >= this.d.stopAt.getTime()) {
+          log.warn("到达收工时间，结束配额等待（下次运行会继续）");
+          return false;
+        }
+        if (this.interrupted || this.d.onInterrupted()) return false;
+        this.setStatusLine(`${label} ${fmtCountdown(remain)} → ${wake.toLocaleTimeString()}`);
+        await sleep(Math.min(1000, remain));
       }
-      if (this.d.stopAt && Date.now() + 30_000 >= this.d.stopAt.getTime()) {
-        log.warn("到达收工时间，结束配额等待（下次运行会继续）");
-        return false;
-      }
-      if (this.interrupted || this.d.onInterrupted()) return false;
-      this.setStatusLine(`${label} ${fmtCountdown(remain)} → ${wake.toLocaleTimeString()}`);
-      await sleep(Math.min(1000, remain));
+    } finally {
+      this.d.quotaSleepHook?.(false);
     }
   }
 

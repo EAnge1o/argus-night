@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0 (2026-10-30)
+
+**真机验证 · 智能配额 · 安全档位 · 自动开守。**
+
+- **真机防漂移验证**：适配器解析测试改用录制的 claude stream-json 样本 fixture；新增"CLI 装了就跑"的 `--help` 旗标校验（自动发现版本漂移）；`ARGUS_REAL_CLI=1 npm test` 可选真机探针（默认跳过不烧配额）。
+- **续跑 recap**：反复卡死换新会话时，自动注入上一任进展摘要（journal 事件 + git 工作区状态 + 任务原文），新 agent 不再从零开始猜。`freshSessionRecap` 可关。
+- **周配额熔断**：同一任务 120 秒内连续触顶 → 睡眠上限从 maxSleepMinutes 升到 24h → 连续 6 次直接放弃该任务并记录 `quota_giveup`，不再整晚空转。
+- **并行配额雪崩告警**：过半 worker 同时进入配额休眠时告警 + webhook 通知；`argus status` 显示每个 worker 的休眠状态。
+- **安全档位 allowlist**：`permissions: "allowlist"` + `claude.allowedTools` → `--allowedTools` 白名单，只放行 Read/Edit/受限 Bash 等，其余在无人值守下自动拒绝。bypass 全开不再是唯一选择。
+- **`argus schedule`**：Windows 一条命令注册任务计划（schtasks + 启动器脚本，避开 /TR 引号地狱），每天定时开守、晨报进 `.argus/schedule.log`；POSIX 输出 cron 行。`--remove` / `--show` 管理。
+- **配置 JSON Schema**：`argus.schema.json`，starter 配置带 `$schema` 引用，编辑器全字段补全。
+- **修复**：CustomAdapter 此前只从 result 行抓 session_id，init 行的会话 id 被漏掉 → 中途崩溃后的续跑拿不到凭据、被迫每次换新会话（新测试抓出的真 bug）。
+- 测试：29 → 41（39 通过 + 2 按设计跳过）。
+
 ## 1.1.0 (2026-10-30)
 
 **并行模式：worktree 隔离的多 agent 夜班。**

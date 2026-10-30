@@ -1,0 +1,115 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/EAnge1o/argus-night/main/argus.schema.json",
+  "title": "Argus night-watchman configuration",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "$schema": { "type": "string" },
+    "agent": { "enum": ["claude", "codex", "custom"], "description": "用哪个 CLI 当夜班工人" },
+    "taskFile": { "type": "string", "description": "markdown 勾选清单路径" },
+    "permissions": {
+      "enum": ["bypass", "acceptEdits", "allowlist", "default"],
+      "description": "bypass=全放开; allowlist=--allowedTools 白名单安全档位; acceptEdits; default"
+    },
+    "idleTimeoutMinutes": {
+      "type": "number",
+      "minimum": 0.1,
+      "description": "看门狗：无输出/无文件活动超过该分钟数即判定卡死"
+    },
+    "freshSessionRecap": {
+      "type": "boolean",
+      "description": "新会话续跑时注入上一任进展摘要（journal + git 状态）"
+    },
+    "backoff": {
+      "type": "object",
+      "properties": {
+        "baseSeconds": { "type": "number", "minimum": 1 },
+        "maxSeconds": { "type": "number", "minimum": 1 },
+        "factor": { "type": "number", "minimum": 1 },
+        "maxConsecutiveCrashes": { "type": "number", "minimum": 1 }
+      }
+    },
+    "hang": {
+      "type": "object",
+      "properties": {
+        "resumeTries": { "type": "number", "minimum": 0 },
+        "freshTries": { "type": "number", "minimum": 0 }
+      }
+    },
+    "quota": {
+      "type": "object",
+      "properties": {
+        "maxSleepMinutes": { "type": "number", "minimum": 0.01 },
+        "extraPatterns": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "stop": {
+      "type": "object",
+      "properties": {
+        "until": { "type": ["string", "null"], "pattern": "^\\d{1,2}:\\d{2}$" },
+        "maxHours": { "type": "number" },
+        "maxCostUsd": { "type": ["number", "null"] },
+        "maxRestarts": { "type": "number" }
+      }
+    },
+    "onTaskFail": { "enum": ["retry-then-next", "skip", "abort"] },
+    "taskRetries": { "type": "number", "minimum": 0 },
+    "parallel": {
+      "type": "object",
+      "properties": {
+        "workers": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "merge": { "enum": ["auto", "leave"] }
+      }
+    },
+    "git": {
+      "type": "object",
+      "properties": {
+        "autoCommit": { "type": "boolean" },
+        "commitMessagePrefix": { "type": "string" }
+      }
+    },
+    "fsHeartbeat": { "type": "boolean" },
+    "fsHeartbeatExclude": { "type": "array", "items": { "type": "string" } },
+    "wrapUp": { "type": "boolean" },
+    "wrapUpPrompt": { "type": "string" },
+    "notify": {
+      "type": "object",
+      "properties": {
+        "webhookUrl": { "type": "string" },
+        "format": { "enum": ["slack", "discord", "lark", "raw"] },
+        "events": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "claude": {
+      "type": "object",
+      "properties": {
+        "extraArgs": { "type": "array", "items": { "type": "string" } },
+        "streamHeartbeat": { "type": "boolean" },
+        "allowedTools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "permissions=allowlist 时的工具白名单，如 Read/Edit/Bash(git *)"
+        }
+      }
+    },
+    "codex": {
+      "type": "object",
+      "properties": {
+        "extraArgs": { "type": "array", "items": { "type": "string" } },
+        "promptVia": { "enum": ["arg", "stdin"] },
+        "bypass": { "type": "boolean" },
+        "resumeMode": { "enum": ["exec-resume-last", "none"] }
+      }
+    },
+    "custom": {
+      "type": "object",
+      "properties": {
+        "command": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "promptVia": { "enum": ["stdin", "arg"] },
+        "resumeArgs": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

@@ -1,11 +1,14 @@
 <div align="center">
 
 [![CI](https://github.com/EAnge1o/argus-night/actions/workflows/ci.yml/badge.svg)](https://github.com/EAnge1o/argus-night/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/argus-night)](https://www.npmjs.com/package/argus-night)
 [![Node](https://img.shields.io/badge/node-%E2%89%A518.17-brightgreen)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![zero dependencies](https://img.shields.io/badge/runtime%20deps-0-orange)](package.json)
 
 # 🌙 Argus — coding agent 守夜人
+
+[English](README.en.md) | 中文
 
 **整晚无人值守地驱动 Claude Code / Codex 等编码 agent：
 配额到点自动续跑 · 指数退避抗击 API 繁忙 · 心跳看门狗清理卡死进程 · 天亮交一份晨报。**
@@ -97,7 +100,9 @@ npx argus-night run --prompt "把 src 下所有 any 类型修掉并跑通测试"
 
 **③ 指数退避**：API 繁忙 / 崩溃从 30s 起步翻倍到 30min 封顶，带 50%–100% 随机抖动防雪崩；任务成功即重置。连续崩溃超限自动放弃该任务。
 
-**④ 看门狗**：两条心跳通道——stdout 任何字节 + 仓库文件系统活动（agent 在写文件当然算活着）。`idleTimeoutMinutes` 无任何活动才判定卡死：Windows 用 `taskkill /T /F`、POSIX 用进程组信号，把 agent 拉起的整个子进程树清干净，然后先续原会话、再换新会话、最后放弃并记入晨报。
+**④ 看门狗**：两条心跳通道——stdout 任何字节 + 仓库文件系统活动（agent 在写文件当然算活着）。`idleTimeoutMinutes` 无任何活动才判定卡死：Windows 用 `taskkill /T /F`、POSIX 用进程组信号，把 agent 拉起的整个子进程树清干净，然后先续原会话、再换新会话、最后放弃并记入晨报。**换新会话时自动注入 recap**——上一任的事件摘要 + git 工作区状态 + 任务原文，新 agent 不用从零猜进展（`freshSessionRecap` 可关）。
+
+**配额智能**：同一任务 120 秒内反复触顶（周限额/账户问题的典型特征）会逐级升级——睡眠上限提到 24h，连续 6 次直接熔断放弃并记录 `quota_giveup`，绝不整晚空转；并行模式下过半 worker 休眠会触发雪崩告警 + webhook 通知。
 
 **断点层**：`.argus/journal-*.jsonl` 记录每一次 spawn / 杀进程 / 配额等待 / 退避 / 成本；TODO.md 本身就是断点——完成打勾、失败留白，下次 `argus run` 自动接着干。
 
@@ -123,7 +128,8 @@ argus run --parallel 3 --until 07:00
 |---|---|
 | `argus init [--force]` | 生成带注释的 `argus.config.jsonc` + 示例 `TODO.md` + `.gitignore` |
 | `argus run [选项]` | 开始夜间值守（别名 `night`） |
-| `argus status [--follow]` | 另一个终端 / SSH 里看实时状态和最近事件 |
+| `argus schedule --at 23:00 [--until 07:00]` | 每天定时自动开守（Windows 任务计划 / POSIX 输出 cron 行）；`--remove` / `--show` 管理 |
+| `argus status [--follow]` | 另一个终端 / SSH 里看实时状态、worker 休眠情况和最近事件 |
 | `argus report [--rebuild]` | 打印最近一次晨报 |
 | `argus doctor [--probe]` | 守夜前体检；`--probe` 真实调用一次 agent 验证整条链路 |
 
@@ -140,7 +146,8 @@ argus run --parallel 3 --until 07:00
 
 ## 安全须知（务必读）
 
-- Claude 适配器默认加 `--dangerously-skip-permissions`——这是无人值守的必要条件，但也意味着 agent 可以不经确认执行任何命令。**建议在容器 / 虚拟机里跑**。
+- **安全档位**：`permissions: "allowlist"` + `claude.allowedTools`（如 `["Read","Edit","Glob","Grep","Bash(git *)","Bash(npm run test*)"]`）→ 只放行白名单工具，其余调用在无人值守下自动拒绝。夜里要跑测试和改代码、但不想让它执行任意 shell？用这个档位。
+- Claude 适配器默认 `--dangerously-skip-permissions`（bypass）——agent 可以不经确认执行任何命令。**建议在容器 / 虚拟机里跑**，或改用 allowlist 档位。
 - **git 是真正的安全网**：开守前确保仓库干净。`git.autoCommit: true` 可让每个任务完成后自动提交，晨报会列出今夜全部提交。
 - `--max-cost` 用真实美元计费兜底（claude 适配器）；`--until` 保证天亮一定停。
 - Ctrl+C 一次优雅收尾（等当前进程退出、写晨报），两次强制退出。
@@ -161,11 +168,12 @@ npm install
 npm test        # 26 个测试：单元 + 端到端
 ```
 
-端到端测试用 `test/fixtures/fake-agent.mjs` 模拟真实 agent 的全部死法，逐条验证：配额触发→睡眠→同会话续跑→打勾→晨报；挂死→看门狗整树清理（断言父子进程确实死亡）；429→退避→续跑；永久失败→按策略跳过不阻塞后续任务；并行模式→worktree 隔离、自动合并回主分支、同文件冲突保留分支待人工、脏工作区拒绝启动。架构细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+端到端测试用 `test/fixtures/fake-agent.mjs` 模拟真实 agent 的全部死法，逐条验证：配额触发→睡眠→同会话续跑→打勾→晨报；挂死→看门狗整树清理（断言父子进程确实死亡）；429→退避→续跑；永久失败→按策略跳过不阻塞后续任务；并行模式→worktree 隔离、自动合并回主分支、同文件冲突保留分支待人工、脏工作区拒绝启动；recap 注入、周配额熔断。适配器解析用录制的 stream-json fixture 回归，`--help` 旗标校验防止 CLI 版本漂移；`ARGUS_REAL_CLI=1 npm test` 可选真机探针（默认跳过，不烧配额）。架构细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## Roadmap
 
 - [x] 多 agent 并行（worktree 隔离，自动合并 / 冲突保留）— v1.1.0
+- [x] 安全档位 allowlist · 续跑 recap · 周配额熔断 · argus schedule 定时开守 · 配置 Schema — v1.2.0
 - [ ] `argus tui` 全屏仪表盘
 - [ ] Codex 适配器的成本解析（codex --json 成本字段稳定后）
 - [ ] 晨报推送邮件 / Telegram

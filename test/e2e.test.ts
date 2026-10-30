@@ -242,6 +242,40 @@ test("e2e 并行: 脏工作区直接拒绝启动", { timeout: 120_000 }, async (
   assert.doesNotMatch(fs.readFileSync(p.todoPath, "utf8"), /\[x\]/);
 });
 
+test("e2e: 新会话续跑注入 recap（上一任进展摘要）", { timeout: 180_000 }, async () => {
+  cleanFakeState();
+  const p = makeProject(["[hang] recap me"], {
+    // 无 resumeArgs → custom 适配器不支持续跑 → 卡死后直接换全新会话
+    custom: { command: "node", args: [FAKE], promptVia: "stdin", resumeArgs: [] },
+    hang: { resumeTries: 0, freshTries: 3 },
+  });
+  const { code, out } = await runCli(p.root, ["--idle-minutes", "0.1"]);
+  assert.equal(code, 0, `退出码非 0\n${out}`);
+  assert.match(journalText(p.root), /"type":"recap_injected"/);
+  assert.match(out, /已注入续跑 recap/);
+  // fake agent 收到的最后一次 prompt 应带 recap 前缀且包含任务原文
+  const lastPrompt = fs.readFileSync(path.join(os.tmpdir(), "argus-fake-last-prompt.txt"), "utf8");
+  assert.match(lastPrompt, /自动续跑/);
+  assert.match(lastPrompt, /\[hang\] recap me/);
+  assert.match(fs.readFileSync(p.todoPath, "utf8"), /\[x\] \[hang\] recap me/);
+});
+
+test("e2e: 周配额熔断 — 连续 6 次触顶放弃任务，后续任务照常", { timeout: 240_000 }, async () => {
+  cleanFakeState();
+  const p = makeProject(["[weekly] hopeless quota", "normal task after weekly"], {
+    quota: { maxSleepMinutes: 0.05, extraPatterns: [] },
+  });
+  const { code, out } = await runCli(p.root, []);
+  assert.equal(code, 0, `退出码非 0\n${out}`);
+  const j = journalText(p.root);
+  assert.match(j, /"type":"quota_giveup"/);
+  assert.match(j, /"streak":6/);
+  assert.match(j, /"type":"task_failed"/);
+  const md = fs.readFileSync(p.todoPath, "utf8");
+  assert.match(md, /\[ \] \[weekly\] hopeless quota/); // 放弃的不打勾
+  assert.match(md, /\[x\] normal task after weekly/);
+});
+
 test("e2e: --prompt 单条任务模式 + 花费入账", async () => {
   cleanFakeState();
   const p = makeProject(["should be ignored"]);

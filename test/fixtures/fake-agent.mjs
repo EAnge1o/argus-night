@@ -21,6 +21,11 @@ process.stdin.on("end", () => run(Buffer.concat(chunks).toString("utf8")));
 const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 
 function run(prompt) {
+  // 每次都把收到的完整 prompt 落到 tmpdir（recap 注入测试断言用）
+  try {
+    fs.writeFileSync(path.join(os.tmpdir(), "argus-fake-last-prompt.txt"), prompt);
+  } catch { /* ignore */ }
+
   const hash = crypto.createHash("sha1").update(prompt).digest("hex").slice(0, 10);
   const stateFile = path.join(os.tmpdir(), `argus-fake-${hash}.json`);
   const seen = fs.existsSync(stateFile);
@@ -30,19 +35,30 @@ function run(prompt) {
   emit({ type: "system", subtype: "init", session_id: sessionId });
   emit({ type: "assistant", message: `working on: ${prompt.slice(0, 50).replace(/\n/g, " ")}` });
 
-  if (prompt.includes("[hang]") && !seen) {
-    // Spawn a grandchild so kill-tree behavior is actually exercised.
-    const sleeper = spawn(process.execPath, ["-e", "setTimeout(()=>{}, 120000)"], {
-      detached: false,
-      stdio: "ignore",
-    });
-    fs.writeFileSync(
-      path.join(os.tmpdir(), `argus-fake-pids-${hash}.json`),
-      JSON.stringify({ parent: process.pid, child: sleeper.pid, hash }),
-    );
-    emit({ type: "assistant", message: "thinking forever…" });
-    setInterval(() => {}, 60_000); // never emits again → watchdog bait
-    return;
+  if (prompt.includes("[hang]")) {
+    // 一次性卡死：全局标记（与 prompt hash 解耦，因为 recap 会让 prompt 逐次变化）
+    const hangOnce = path.join(os.tmpdir(), "argus-fake-hang-once");
+    if (!fs.existsSync(hangOnce)) {
+      const sleeper = spawn(process.execPath, ["-e", "setTimeout(()=>{}, 120000)"], {
+        detached: false,
+        stdio: "ignore",
+      });
+      fs.writeFileSync(hangOnce, "1");
+      fs.writeFileSync(
+        path.join(os.tmpdir(), `argus-fake-pids-${hash}.json`),
+        JSON.stringify({ parent: process.pid, child: sleeper.pid, hash }),
+      );
+      emit({ type: "assistant", message: "thinking forever…" });
+      setInterval(() => {}, 60_000); // never emits again → watchdog bait
+      return;
+    }
+    // 标记已存在 → 走成功路径（模拟“续跑后恢复”）
+  }
+  if (prompt.includes("[weekly]")) {
+    // 周限额模拟：无论重跑多少次都立刻触顶（用于熔断测试）
+    emit({ type: "assistant", message: "Claude AI usage limit reached. Your limit will reset resets in 2s." });
+    emit({ type: "result", subtype: "error_max_turns", is_error: true, session_id: sessionId, num_turns: 1 });
+    process.exit(0);
   }
   if (prompt.includes("[quota]") && !seen) {
     emit({ type: "assistant", message: "Claude AI usage limit reached. Your limit will reset resets in 2s." });

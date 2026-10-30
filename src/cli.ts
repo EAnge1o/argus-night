@@ -4,9 +4,10 @@ import { cmdStatus } from "./commands/status.js";
 import { cmdReport } from "./commands/report.js";
 import { cmdDoctor } from "./commands/doctor.js";
 import { cmdInit } from "./commands/init.js";
+import { cmdSchedule } from "./commands/schedule.js";
 import { ArgusError } from "./util.js";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 
 const USAGE = `
 🌙 Argus — coding agent 守夜人 v${VERSION}
@@ -20,6 +21,10 @@ const USAGE = `
   argus report [--rebuild]  打印最近一次晨报
   argus doctor [--probe]    守夜前体检（--probe 会真实调用一次 agent）
   argus init [--force]      生成配置模板 + 示例任务清单
+  argus schedule --at 23:00 [--until 07:00] [--parallel 3]
+                            每天 自动开守（Windows 注册任务计划 / POSIX 输出 cron 行）
+  argus schedule --remove   取消自动开守
+  argus schedule --show     查看已注册的开守计划
 
 run 选项:
   --task <file>        任务清单（markdown 勾选列表，默认 TODO.md）
@@ -133,6 +138,17 @@ async function main(): Promise<number> {
       return await cmdDoctor(root, { probe: bool(flags, "probe") === true });
     case "init":
       return cmdInit(root, { force: bool(flags, "force") === true });
+    case "schedule":
+      return cmdSchedule(root, {
+        at: str(flags, "at"),
+        until: str(flags, "until"),
+        parallel: str(flags, "parallel"),
+        agent: str(flags, "agent"),
+        task: str(flags, "task"),
+        maxCost: str(flags, "max-cost"),
+        remove: bool(flags, "remove") === true,
+        show: bool(flags, "show") === true,
+      });
     default:
       console.error(`未知命令: ${command}\n`);
       console.log(USAGE);

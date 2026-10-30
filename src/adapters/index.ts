@@ -30,6 +30,10 @@ export interface AgentAdapter {
 }
 
 function claudePermissionArgs(cfg: ArgusConfig): string[] {
+  if (cfg.permissions === "allowlist") {
+    // 安全档位：只放行白名单工具，其余在 -p 模式下自动拒绝
+    return ["--allowedTools", cfg.claude.allowedTools.join(",")];
+  }
   if (cfg.permissions === "bypass") return ["--dangerously-skip-permissions"];
   if (cfg.permissions === "acceptEdits") return ["--permission-mode", "acceptEdits"];
   return [];
@@ -169,11 +173,14 @@ export class CustomAdapter implements AgentAdapter {
     } catch {
       return null;
     }
-    if (obj["type"] !== "result") return null;
+    // session_id 出现在 init 和 result 两种行里，任何一处都要抓（watchdog 续跑依赖它）
+    if (typeof obj["session_id"] === "string") this.lastSessionId = obj["session_id"];
+    if (obj["type"] !== "result") {
+      return this.lastSessionId ? { sessionId: this.lastSessionId } : null;
+    }
     this.sawResult = true;
     this.isError = obj["is_error"] === true;
     if (typeof obj["total_cost_usd"] === "number") this.costUsd = obj["total_cost_usd"];
-    if (typeof obj["session_id"] === "string") this.lastSessionId = obj["session_id"];
     return { sessionId: this.lastSessionId ?? undefined, costUsd: this.costUsd ?? undefined };
   }
 

@@ -4,11 +4,12 @@ import { ArgusError } from "./util.js";
 
 export type AgentKind = "claude" | "codex" | "custom";
 export type PromptVia = "stdin" | "arg";
+export type PermissionMode = "bypass" | "acceptEdits" | "allowlist" | "default";
 
 export interface ArgusConfig {
   agent: AgentKind;
   taskFile: string;
-  permissions: "bypass" | "acceptEdits" | "default";
+  permissions: PermissionMode;
   idleTimeoutMinutes: number;
   backoff: {
     baseSeconds: number;
@@ -26,6 +27,8 @@ export interface ArgusConfig {
   };
   onTaskFail: "retry-then-next" | "skip" | "abort";
   taskRetries: number;
+  /** 新会话续跑时注入 journal 摘要 + git 状态的 recap 提示词 */
+  freshSessionRecap: boolean;
   parallel: { workers: number; merge: "auto" | "leave" };
   git: { autoCommit: boolean; commitMessagePrefix: string };
   fsHeartbeat: boolean;
@@ -37,7 +40,7 @@ export interface ArgusConfig {
     format: "slack" | "discord" | "lark" | "raw";
     events: string[];
   };
-  claude: { extraArgs: string[]; streamHeartbeat: boolean };
+  claude: { extraArgs: string[]; streamHeartbeat: boolean; allowedTools: string[] };
   codex: {
     extraArgs: string[];
     promptVia: PromptVia;
@@ -68,6 +71,7 @@ export const DEFAULT_CONFIG: ArgusConfig = {
   stop: { until: null, maxHours: 12, maxCostUsd: null, maxRestarts: 200 },
   onTaskFail: "retry-then-next",
   taskRetries: 2,
+  freshSessionRecap: true,
   parallel: { workers: 1, merge: "auto" },
   git: { autoCommit: false, commitMessagePrefix: "argus:" },
   fsHeartbeat: true,
@@ -76,7 +80,7 @@ export const DEFAULT_CONFIG: ArgusConfig = {
   wrapUpPrompt:
     "夜间值守结束：请收尾当前工作——完成手头修改、运行测试、用 git 提交全部变更，并写一段简短的进展总结。",
   notify: { webhookUrl: "", format: "slack", events: ["quota", "task_done", "task_failed", "run_end"] },
-  claude: { extraArgs: [], streamHeartbeat: true },
+  claude: { extraArgs: [], streamHeartbeat: true, allowedTools: [] },
   codex: {
     extraArgs: [],
     promptVia: "stdin",
@@ -179,6 +183,20 @@ export function validateConfig(cfg: ArgusConfig): void {
     `parallel.merge 必须是 auto / leave，当前为 "${cfg.parallel.merge}"`,
   );
   expect(
+    ["bypass", "acceptEdits", "allowlist", "default"].includes(cfg.permissions),
+    `permissions 必须是 bypass / acceptEdits / allowlist / default，当前为 "${cfg.permissions}"`,
+  );
+  if (cfg.permissions === "allowlist") {
+    expect(
+      cfg.claude.allowedTools.length > 0,
+      'permissions 为 allowlist 时必须配置 claude.allowedTools，例如 ["Read","Edit","Glob","Grep","Bash(git *)","Bash(npm test *)"]',
+    );
+  }
+  expect(
+    Number.isFinite(cfg.quota.maxSleepMinutes) && cfg.quota.maxSleepMinutes >= 0.01,
+    "quota.maxSleepMinutes 必须 >= 0.01",
+  );
+  expect(
     cfg.onTaskFail === "retry-then-next" ||
       cfg.onTaskFail === "skip" ||
       cfg.onTaskFail === "abort",
@@ -239,6 +257,9 @@ export function loadConfig(root: string): { config: ArgusConfig; file: string | 
 /** Build a fully-commented starter config for `argus init`. */
 export function starterConfigText(): string {
   return `{
+  // 编辑器自动补全：VS Code / JetBrains 识别 $schema 后会提示所有字段
+  "$schema": "https://raw.githubusercontent.com/EAnge1o/argus-night/main/argus.schema.json",
+
   // Argus 守夜人配置。带 // 的注释行可以随意保留或删除。
   // agent: 用哪个 CLI 当夜班工人 → "claude" | "codex" | "custom"
   "agent": "claude",
@@ -246,8 +267,11 @@ export function starterConfigText(): string {
   // 任务清单：markdown 勾选列表，argus 逐条喂给 agent，完成一条勾掉一条
   "taskFile": "TODO.md",
 
-  // 权限模式（仅 claude 生效）：无人值守通常需要 bypass
-  // bypass = --dangerously-skip-permissions, acceptEdits = --permission-mode acceptEdits, default = 不加参数
+  // 权限模式（仅 claude 生效）：
+  //   bypass      = --dangerously-skip-permissions，全放开（无人值守最常用）
+  //   allowlist   = --allowedTools 白名单，只放行列出的工具，其余一律拒绝（安全档位，推荐）
+  //   acceptEdits = --permission-mode acceptEdits
+  //   default     = 不加参数
   "permissions": "bypass",
 
   // 看门狗：agent 超过这么多分钟没有任何输出 / 文件活动 → 判定卡死，杀掉并续跑
@@ -270,6 +294,9 @@ export function starterConfigText(): string {
   "onTaskFail": "retry-then-next",
   "taskRetries": 2,
 
+  // 反复卡死换用全新会话时，自动注入"上一任干到哪了"的 recap（journal 摘要 + git 状态）
+  "freshSessionRecap": true,
+
   // 并行模式：N 个 worker 各自在一个独立 git worktree 里领任务，互不踩脚
   // workers: 1 = 顺序（默认）。并行要求：当前目录是干净的 git 仓库且有提交。
   // merge: "auto" = 任务成功后自动提交并合并回主分支（冲突则保留分支待人工）；
@@ -290,8 +317,9 @@ export function starterConfigText(): string {
   // 通知：留空则不发。format: slack | discord | lark(飞书) | raw
   "notify": { "webhookUrl": "", "format": "slack", "events": ["quota", "task_done", "task_failed", "run_end"] },
 
-  // Claude Code 专属参数
-  "claude": { "extraArgs": [], "streamHeartbeat": true },
+  // Claude Code 专属参数。allowedTools 示例（安全档位）:
+  //   ["Read","Edit","Write","Glob","Grep","Bash(git *)","Bash(npm run test*)","Bash(npm install)"]
+  "claude": { "extraArgs": [], "streamHeartbeat": true, "allowedTools": [] },
 
   // Codex 专属参数。resumeMode: exec-resume-last = codex exec resume --last 续跑上一会话
   "codex": { "extraArgs": [], "promptVia": "stdin", "bypass": true, "resumeMode": "exec-resume-last" },

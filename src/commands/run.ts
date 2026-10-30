@@ -108,6 +108,16 @@ interface ScopeDeps {
   failed: { count: number };
 }
 
+/** 并行配额雪崩：过半 worker 在配额休眠（total ≥ 2 才有意义）。 */
+export function majorityQuotaSleeping(
+  statuses: { sleeping?: string }[],
+  total: number,
+): boolean {
+  if (total < 2) return false;
+  const asleep = statuses.filter((s) => s.sleeping === "quota").length;
+  return asleep >= Math.ceil(total / 2);
+}
+
 function setStopReason(box: { value: string }, reason: string): void {
   // First reason wins; the default "全部任务完成" is replaced by whatever ends the run.
   if (box.value === "全部任务完成") box.value = reason;
@@ -123,7 +133,13 @@ function stopChecks(deps: ScopeDeps, cfg: ArgusConfig): string | null {
 }
 
 /** Make a runner for a given working directory and register it for SIGINT kills. */
-function makeRunner(deps: ScopeDeps, cwd: string, workerId: number | undefined, dryRun: boolean): AgentRunner {
+function makeRunner(
+  deps: ScopeDeps,
+  cwd: string,
+  workerId: number | undefined,
+  dryRun: boolean,
+  quotaSleepHook?: (asleep: boolean) => void,
+): AgentRunner {
   const runner = new AgentRunner({
     cfg: deps.cfg,
     journal: deps.journal,
@@ -134,6 +150,7 @@ function makeRunner(deps: ScopeDeps, cwd: string, workerId: number | undefined, 
     onInterrupted: deps.interrupted,
     cwd,
     workerId,
+    quotaSleepHook,
   });
   deps.activeRunners.push(runner);
   return runner;
@@ -261,11 +278,24 @@ async function runParallel(deps: ScopeDeps): Promise<void> {
     worktrees.push(manager.create(i, deps.journal.runId));
   }
 
-  const workerStatus: { id: number; task: string | null }[] = worktrees.map((wt) => ({ id: wt.id, task: null }));
+  const workerStatus: { id: number; task: string | null; sleeping?: string }[] = worktrees.map((wt) => ({
+    id: wt.id,
+    task: null,
+  }));
   const publishWorkers = () => journal.setStatusExtra({ workers: workerStatus.map((w) => ({ ...w })) });
+  const avalanche = { warned: false };
 
   const workerLoop = async (wt: Worktree): Promise<void> => {
-    const runner = makeRunner(deps, wt.path, wt.id, false);
+    const runner = makeRunner(deps, wt.path, wt.id, false, (asleep: boolean) => {
+      workerStatus[wt.id].sleeping = asleep ? "quota" : undefined;
+      publishWorkers();
+      if (asleep && !avalanche.warned && majorityQuotaSleeping(workerStatus, workerCount)) {
+        avalanche.warned = true;
+        const asleepCount = workerStatus.filter((w) => w.sleeping === "quota").length;
+        log.warn(`⚠ 并行配额雪崩：${asleepCount}/${workerCount} 个 worker 在配额休眠，实际并行度下降`);
+        notify.send("quota", "😴 并行配额雪崩", `${asleepCount}/${workerCount} 个 worker 因配额休眠，今晚实际并行度下降。`);
+      }
+    });
     const label = `w${wt.id}`;
 
     for (;;) {
@@ -373,7 +403,9 @@ export async function cmdRun(root: string, flags: RunFlags): Promise<number> {
     `agent: ${cfg.agent} · 任务清单: ${flags.prompt ? "（单条任务模式）" : cfg.taskFile} · worker: ${cfg.parallel.workers}`,
   );
   log.info(`收工条件: ${deadlines.length ? deadlines.join(" · ") : "全部任务完成"}`);
-  if (cfg.permissions === "bypass" && cfg.agent === "claude") {
+  if (cfg.permissions === "allowlist") {
+    log.info(`安全档位 allowlist：agent 仅允许 ${cfg.claude.allowedTools.length} 类白名单工具（${cfg.claude.allowedTools.join(", ").slice(0, 120)}），其余调用一律拒绝`);
+  } else if (cfg.permissions === "bypass" && cfg.agent === "claude") {
     log.warn("已启用 --dangerously-skip-permissions：agent 可以不经确认执行任何命令。建议在容器/虚拟机中运行，并确保 git 仓库干净可回滚。");
   }
   if (cfg.parallel.workers > 1 && cfg.permissions === "bypass") {
