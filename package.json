@@ -1,6 +1,6 @@
 {
   "name": "argus-night",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Argus — the night watchman for coding agents: unattended overnight runs with quota-aware resume, a heartbeat watchdog, exponential backoff, and a morning report.",
   "author": "EAnge1o",
   "repository": {
@@ -16,7 +16,8 @@
     "node": ">=18.17"
   },
   "bin": {
-    "argus": "dist/src/cli.js"
+    "argus": "dist/src/cli.js",
+    "argus-night": "dist/src/cli.js"
   },
   "files": [
     "dist",

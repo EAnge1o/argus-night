@@ -7,7 +7,7 @@ import { cmdInit } from "./commands/init.js";
 import { cmdSchedule } from "./commands/schedule.js";
 import { ArgusError } from "./util.js";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.2.1";
 
 const USAGE = `
 🌙 Argus — coding agent 守夜人 v${VERSION}
